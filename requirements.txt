@@ -8,3 +8,9 @@ tensorflow
 keras
 google-cloud-storage
 flask-cors
+Cython
+plotly
+prophet
+statsmodels
+pmdarima
+seaborn

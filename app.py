@@ -16,6 +16,9 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import time
 from flask_cors import CORS
+# import plotly
+import seaborn as sns
+import json
 
 # Tensorflow (Keras & LSTM) related packages
 import tensorflow as tf
@@ -23,6 +26,18 @@ from tensorflow.python.keras import Sequential
 from tensorflow.python.keras.layers import Input, Dense, LSTM, Dropout
 from tensorflow.python.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
+
+#prophet related packages
+# import pystan
+# import prophet
+from prophet import Prophet
+from prophet.diagnostics import cross_validation
+from prophet.diagnostics import performance_metrics
+from prophet.plot import plot_cross_validation_metric
+from prophet.plot import plot_plotly, plot_components_plotly
+
+# stats model related packages
+import statsmodels.api as sm
 
 # Import required storage package from Google Cloud Storage
 from google.cloud import storage
@@ -52,11 +67,58 @@ def build_actual_response(response):
                          "PUT, GET, POST, DELETE, OPTIONS")
     return response
 
+
+def get_consistent_data(data_frame):
+    d = data_frame
+    d.columns = ['ds', 'y'] 
+    d['ds'] = d['ds'].astype('datetime64[ns]')
+    array = d.to_numpy()
+    x = np.array([time.mktime(i[0].timetuple()) for i in array])
+    y = np.array([i[1] for i in array])
+    lzip = lambda *x: list(zip(*x))
+    days = d.groupby('ds')['ds'].value_counts()
+    Y = d['y'].values
+    X = lzip(*days.index.values)[0]
+    return X,Y
+
+def get_created_closed_data(data_frame, request_type):
+    df = data_frame.groupby([request_type], as_index=False).count()
+    d = df[[request_type, 'issue_number']]
+    X,Y = get_consistent_data(d)
+    firstDay = min(X)
+    Ys = [0, ]*((max(X) - firstDay).days + 1)
+    days = pd.Series([firstDay + timedelta(days=i)
+                      for i in range(len(Ys))])
+    for x, y in zip(X, Y):
+        Ys[(x - firstDay).days] = y
+    return Ys, days
+
+def get_pull_request_data(data_frame):
+    created_df = data_frame.groupby(['created_at'], as_index=False).count()
+    created_df = created_df[['created_at', 'issue_number']]
+    closed_df = data_frame.groupby(['closed_at'], as_index=False).count()
+    closed_df = closed_df[['closed_at', 'issue_number']]
+    X1,Y1 = get_consistent_data(created_df)
+    X2,Y2 = get_consistent_data(closed_df)
+    first_day = min(min(X1),min(X2))
+    last_day = max(max(X1),max(X2))
+
+    Y1s = [0, ]*((last_day - first_day).days + 1)
+    Y2s = [0, ]*((last_day - first_day).days + 1)
+    days = pd.Series([first_day +timedelta(days=i)
+                    for i in range(len(Y1s))])
+
+    for x, y in zip(X1, Y1):
+        Y1s[(x - first_day).days] = y
+    for x, y in zip(X2, Y2):
+        Y2s[(x - first_day).days] = y
+    Ys = [Y1s[i] + Y2s[i] for i in range(len(Y1s))]
+    return Ys, days
+
 '''
 API route path is  "/api/forecast"
 This API will accept only POST request
 '''
-
 @app.route('/api/forecast', methods=['POST'])
 def forecast():
     body = request.get_json()
@@ -64,11 +126,29 @@ def forecast():
     type = body["type"]
     repo_name = body["repo"]
     data_frame = pd.DataFrame(issues)
-    df1 = data_frame.groupby([type], as_index=False).count()
-    df = df1[[type, 'issue_number']]
-    df.columns = ['ds', 'y']
+    # print(data_frame)
+    if type == 'pull':
+        Ys, days = get_pull_request_data(data_frame)
+        df = pd.DataFrame()
+        df['ds'] = days
+        df['y'] = Ys
+    elif type == 'committed_at':
+        data_frame['committed_at'] = data_frame['committed_at'].astype('datetime64[ns]')
+        data_frame['committed_at'] = data_frame['committed_at'].dt.date
+        df1 = data_frame.groupby([type], as_index=False).count()
+        df = df1[[type, 'sha']]
+        df.columns = ['ds', 'y']
+    else:
+        df1 = data_frame.groupby([type], as_index=False).count()
+        df = df1[[type, 'issue_number']]
+        df.columns = ['ds', 'y']
 
     df['ds'] = df['ds'].astype('datetime64[ns]')
+    # print(df)
+
+    # ~~~~~~~~~~~~~LSTM~~~~~~~~~~~~~~~~~~~~
+    print("Mehak : entered the forecast method tensor")
+
     array = df.to_numpy()
     x = np.array([time.mktime(i[0].timetuple()) for i in array])
     y = np.array([i[1] for i in array])
@@ -79,7 +159,6 @@ def forecast():
     Y = df['y'].values
     X = lzip(*days.index.values)[0]
     firstDay = min(X)
-
     '''
     To achieve data consistancy with both actual data and predicted values, 
     add zeros to dates that do not have orders
@@ -117,6 +196,8 @@ def forecast():
     Here LSTM looks at approximately one month data
     '''
     look_back = 30
+    if type == 'committed_at':
+        look_back = 1
     X_train, Y_train = create_dataset(train, look_back)
     X_test, Y_test = create_dataset(test, look_back)
 
@@ -221,11 +302,100 @@ def forecast():
     new_blob.upload_from_filename(
         filename=LOCAL_IMAGE_PATH + LSTM_GENERATED_IMAGE_NAME)
 
+    # ~~~~~~~~~~~~~PROPHET~~~~~~~~~~~~~~~~~~~~
+    print("Mehak : entered the forecast method Prophet")
+
+    model = Prophet()
+    model.fit(df)
+
+    future = model.make_future_dataframe(periods=50)
+    forecast = model.predict(future)
+
+    # Creating the image path for model loss, LSTM generated image and all issues data image
+    PROPHET_FORECAST_LINE_IMAGE_NAME = "prophet_forecast_line_" + type +"_"+ repo_name + ".png"
+    PROPHET_FORECAST_LINE_URL = BASE_IMAGE_PATH + PROPHET_FORECAST_LINE_IMAGE_NAME
+
+    PROPHET_FORECAST_IMAGE_NAME = "prophet_forecast_" + type +"_"+ repo_name + ".png"
+    PROPHET_FORECAST_URL = BASE_IMAGE_PATH + PROPHET_FORECAST_IMAGE_NAME
+
+    model.plot_components(forecast).savefig(LOCAL_IMAGE_PATH + PROPHET_FORECAST_LINE_IMAGE_NAME)
+    model.plot(forecast).savefig(LOCAL_IMAGE_PATH + PROPHET_FORECAST_IMAGE_NAME)
+
+    # Uploads an images into the google cloud storage bucket
+    bucket = client.get_bucket(BUCKET_NAME)
+    new_blob = bucket.blob(PROPHET_FORECAST_LINE_IMAGE_NAME)
+    new_blob.upload_from_filename(
+        filename=LOCAL_IMAGE_PATH + PROPHET_FORECAST_LINE_IMAGE_NAME)
+    new_blob = bucket.blob(PROPHET_FORECAST_IMAGE_NAME)
+    new_blob.upload_from_filename(
+        filename=LOCAL_IMAGE_PATH + PROPHET_FORECAST_IMAGE_NAME)
+
+
+    # ~~~~~~~~~~~~~STATS MODEL~~~~~~~~~~~~~~~~~~~~
+    print("Mehak : entered the forecast method StatsModel")
+
+    df.set_index('ds')
+    # print(df)
+    predict = sm.tsa.seasonal_decompose(df.index, period=7)
+    
+    # Creating the image path for model loss, LSTM generated image and all issues data image
+    STATS_MODEL_FIT_IMAGE_NAME = "stats_model_fit_line_" + type +"_"+ repo_name + ".png"
+    STATS_MODEL_FIT_URL = BASE_IMAGE_PATH + STATS_MODEL_FIT_IMAGE_NAME
+
+    STATS_MODEL_FORECAST_IMAGE_NAME = "stats_model_forecast_" + type +"_"+ repo_name + ".png"
+    STATS_MODEL_FORECAST_URL = BASE_IMAGE_PATH + STATS_MODEL_FORECAST_IMAGE_NAME
+
+    predict.plot().savefig(LOCAL_IMAGE_PATH + STATS_MODEL_FIT_IMAGE_NAME)
+
+    # try to graph data with dates at x axis
+    lzip = lambda *x:list(zip(*x))
+
+    days = df.groupby('ds')['ds'].value_counts()
+    Y = df['y'].values
+    X = lzip(*days.index.values)[0]
+    firstDay = min(X)
+
+    # To achieve data consistancy with both actual data and predicted values, I'm adding zeros to dates that do not have orders 
+    Ys = [0,]*((max(X) - firstDay).days + 1)#[firstDay + timedelta(days=day) for day in range((max(X) - firstDay).days + 1)]
+    days = pd.Series([firstDay + timedelta(days=i) for i in range(len(Ys))])
+    for x, y in zip(X, Y):
+        Ys[(x - firstDay).days] = y
+    # parameters of the stats model is based on the below two graphs
+    est = sm.tsa.ARIMA(Ys, order=(1,0,1)).fit()
+    yHat = est.fittedvalues
+    
+    fig, axs = plt.subplots(1, 1, figsize=(15, 8))
+    X = mdates.date2num(days)
+    axs.plot(X, yHat, c='red', label='Forecast')
+    axs.plot(X, Ys, marker='.', label='Data')
+    locator = mdates.AutoDateLocator()
+    axs.xaxis.set_major_locator(locator)
+    axs.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
+    axs.legend()
+    axs.set_title('Actual vs Stats model Predicted Graph')
+    axs.set_xlabel('Date')
+    axs.set_ylabel('Orders')
+    # plt.show()
+    plt.savefig(LOCAL_IMAGE_PATH + STATS_MODEL_FORECAST_IMAGE_NAME)
+
+    # Uploads an images into the google cloud storage bucket
+    bucket = client.get_bucket(BUCKET_NAME)
+    new_blob = bucket.blob(STATS_MODEL_FIT_IMAGE_NAME)
+    new_blob.upload_from_filename(
+        filename=LOCAL_IMAGE_PATH + STATS_MODEL_FIT_IMAGE_NAME)
+    new_blob = bucket.blob(STATS_MODEL_FORECAST_IMAGE_NAME)
+    new_blob.upload_from_filename(
+        filename=LOCAL_IMAGE_PATH + STATS_MODEL_FORECAST_IMAGE_NAME)
+
     # Construct the response
     json_response = {
         "model_loss_image_url": MODEL_LOSS_URL,
         "lstm_generated_image_url": LSTM_GENERATED_URL,
-        "all_issues_data_image": ALL_ISSUES_DATA_URL
+        "all_issues_data_image": ALL_ISSUES_DATA_URL,
+        "prophet_forecast_image_line_url": PROPHET_FORECAST_LINE_URL,
+        "prophet_forecast_image_url": PROPHET_FORECAST_URL,
+        "stats_model_image_line_url": STATS_MODEL_FIT_URL,
+        "stats_model_forecast_image_url": STATS_MODEL_FORECAST_URL
     }
     # Returns image url back to flask microservice
     return jsonify(json_response)
